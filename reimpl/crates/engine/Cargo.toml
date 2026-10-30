@@ -1,0 +1,10 @@
+[package]
+name = "engine"
+description = "Open-source reimplementation foundation for the Prototype 2 engine (asset virtual filesystem, Pure3D graph, entity model, mission schema)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cement = { workspace = true }

@@ -1,0 +1,667 @@
+#!/usr/bin/env bash
+# Single entry point for the Prototype 2 modding tooling.
+#
+#   ./proto2 status          check the install, PreferLooseFiles and what is installed
+#   ./proto2 titles          list every mission title in the English text bible
+#   ./proto2 missions        list every mission definition (proto path + time of day)
+#   ./proto2 fields <m>      show the editable fields of one mission
+#   ./proto2 set-title <m> <t>   change a mission title (any length)
+#   ./proto2 set-mission <m> <f> <v>   change a mission field (e.g. timeOfDay)
+#   ./proto2 mission <m>         dump a mission's full decoded definition
+#   ./proto2 paths <m>           list every editable path with its constant slot
+#   ./proto2 set-aspect <m> <path> <value>   edit any scalar field
+#   ./proto2 export <m> [file]   write an editable text copy of a mission
+#   ./proto2 apply-aspects <file>   apply edits from that text file
+#   ./proto2 build           build the first-mission mod into work/mod
+#   ./proto2 install         copy work/mod into the game directory (loose files)
+#   ./proto2 install --no-debug   install only our own files (bisect aid)
+#   ./proto2 install --debug-mode archives|full|none   staged bisect
+#   ./proto2 clean           reset work/mod to the debug menu + override pack and reinstall
+#   ./proto2 state           show payload vs staged files in work/mod
+#   ./proto2 revert          undo exactly what install wrote
+#   ./proto2 verify          offline checks on the built mod
+#   ./proto2 bundle [out]    portable tar.gz of the tooling (for another machine)
+#   ./proto2 play            print the launch + log-check commands
+#   ./proto2 snapshot create|list|restore   verified tar.gz of work/mod + install manifest (rollback point)
+#   ./proto2 convert-all         bulk: convert every provably equivalent bytecode record, abort on gate failure
+#   ./proto2 coverage [--top N]   corpus-wide record classification + per-mission ranking (docs/19)
+#   ./proto2 dupes               fail if a mission/variant exists in more than one corpus tree
+#   ./proto2 check               run every self-check (fsm round-trip, GUI selftest/uicheck, single-truth)
+#   ./proto2 capture status|on|off   payload recorder state
+#   ./proto2 harvest             fold a playthrough capture into the cache, then archive it
+#   ./proto2 script --mission M <cmd>   mission LUA TEXT: list, extract, replace, export, apply, decompile,
+#                                     coverage, ctrl, diff, batch   (docs/19; the main editing surface)
+#   ./proto2 api [mission|<family>]   the engine's Lua binding surface (docs/21)
+#   ./proto2 address --mission M --list|--filter T|--set 'ADDR/SUB:x,y,z'
+#   ./proto2 placement --mission M --name GROUP_OR_SUB --sub NEW --at x,y,z   add an address entry
+#   ./proto2 fsm --mission M [--replace OLD --with NEW]   a mission's FSM Lua
+#   ./proto2 fsm --missions      every mission that has FSM Lua
+#   ./proto2 gui              desktop mission editor (docs/20)
+#   ./proto2 seed             copy the tracked debug-menu payload back into work/mod
+#   ./proto2 progress         measure Lua recovery (docs/23); --write-doc refreshes it
+#   ./proto2 library build|list|grep|show   the engine's built-in Lua library (docs/21)
+#   ./proto2 evidence        which staged records a capture proves the engine loaded
+#   ./proto2 overrides       export/apply/list the hand-reconstructed pack (docs/26)
+#   ./proto2 spawn           stage an entity spawn into a mission (docs/19)
+#   ./proto2 bench [--kit DIR]   measure a LuaDec kit against the corpus; fails if any record regresses
+#   ./proto2 served          did the last session actually run our converted records? (capture evidence)
+#   ./proto2 leaks [--tree REV|--range A..B]   refuse to publish game data, captures or host paths
+#   ./proto2 corpus           rebuild tmp/corpus from the game archives (after deleting tmp/)
+#   ./proto2 game [PATH]      show the game directory, or store it in proto2.config.json
+#   ./proto2 config [show|get|set|unset|path]   every project setting (game dir, capture version, GUI)
+#   ./proto2 doctor           check this machine is ready (python, game dir, PrototypeFix, LuaDec, corpus)
+#   ./proto2 launch --begin|--end   keep one run's logs and read what the engine opened (docs/30)
+#   ./proto2 publish          publish new local commits on top of the single public root (--reset re-roots it)
+#   ./proto2 help             this list
+#
+# Settings live in proto2.config.json (template: proto2.config.example.json); PROTO2_GAME overrides game_dir.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PY="${PYTHON:-python3}"
+# Configuration lives in proto2.config.json (see tools/config.py); PROTO2_GAME still overrides game_dir.
+# The wrapper resolves it once for its own checks; python tools read the same file themselves.
+eval "$("$PY" "$ROOT/tools/config.py" shell)"
+# no export: python tools read proto2.config.json themselves (or PROTO2_GAME when the user sets it),
+# which keeps `./proto2 config show` able to report where the value really came from.
+MOD="$ROOT/work/mod"
+STATE="$ROOT/work/state"
+
+die() { echo "error: $*" >&2; exit 1; }
+need_game() {
+  [ -n "$GAME" ] || die 'game directory not set: ./proto2 config set game_dir "/path/to/Prototype 2"'
+  [ -d "$GAME" ] || die "game directory not found: $GAME (fix it with ./proto2 config set game_dir ...)"
+}
+ensure_mission_script() {
+    mkdir -p "$MOD/scripts"
+    if [ ! -f "$MOD/scripts/missiondefinit.lua" ]; then
+      tmp=$(mktemp -d "$ROOT/tmp/md.XXXXXX")
+      "$PY" "$ROOT/tools/rcf.py" "$GAME/boot.rcf" extract "$tmp" --filter 'scripts\missiondefinit.lua' >/dev/null 2>&1
+      cp "$tmp/scripts/missiondefinit.lua" "$MOD/scripts/missiondefinit.lua"
+      rm -rf "$tmp"
+      echo "(took a copy of scripts/missiondefinit.lua into $MOD/scripts)" >&2
+    fi
+  }
+
+
+cmd="${1:-help}"; shift || true
+
+case "$cmd" in
+  status)
+    need_game
+    echo "repo    $ROOT"
+    echo "game    $GAME"
+    if [ -f "$GAME/prototype_fix.ini" ]; then
+      loose=$(grep -iE '^[[:space:]]*PreferLooseFiles[[:space:]]*=' "$GAME/prototype_fix.ini" | tail -1 || true)
+      echo "asi     ${loose:-PreferLooseFiles not found in prototype_fix.ini}"
+      case "$loose" in *true*) ;; *) echo "        WARNING: loose-file override is not enabled" ;; esac
+    else
+      echo "asi     prototype_fix.ini not found — loose override will NOT work"
+    fi
+    # archives
+    archives=$(find "$GAME" -maxdepth 1 -name '*.rcf' | wc -l)
+    echo "archives $archives .rcf files"
+    # installed loose files
+    if [ -f "$STATE/install-manifest.json" ]; then
+      echo "installed mod:"
+      "$PY" - "$STATE/install-manifest.json" <<'PYEOF'
+import json,sys
+m=json.load(open(sys.argv[1]))
+for rel,info in m.get("installed",{}).items():
+    print(f"   {rel}{'  (displaced file backed up)' if info.get('displaced') else ''}")
+PYEOF
+    else
+      echo "installed mod: none"
+    fi
+    ;;
+
+  api)
+    # The engine's Lua binding surface, re-derived from the shipped DLL.
+    # This is what a mission script can actually call. See docs/15.
+    need_game
+    shift_args=""
+    case "${1:-}" in
+      ""|all)   shift_args="" ;;
+      mission)  shift_args="--mission" ;;
+      fe_*|mm_*) shift_args="--prefix ${1}" ;;
+      *) die "usage: ./proto2 api [mission|<family>]   e.g. ./proto2 api mm_" ;;
+    esac
+    # shellcheck disable=SC2086
+    "$PY" "$ROOT/tools/luaapi.py" list $shift_args \
+      --dll "$GAME/prototype2engine.dll"
+    ;;
+
+  placement)
+    # Add an address to a mission's address table (tod.p3d.rz), verified by read-back.
+    #   ./proto2 placement --mission M --name GROUP_OR_SUB --sub NEW_NAME --at x,y,z [--dry-run]
+    "$PY" "$ROOT/tools/address.py" "$@"
+    ;;
+
+  address)
+    # The address table (Address records inside a mission's tod.p3d).
+    # See docs/16-meta-object-layout.md. Arguments are passed through.
+    need_game
+    "$PY" "$ROOT/tools/stage_address.py" "$@"
+    ;;
+
+  script)
+    # List / extract / edit the Lua embedded in a mission's FSM graph, with full verification.
+    # See docs/19-mission-fsm-format.md and tools/script_edit.py.
+    need_game
+    "$PY" "$ROOT/tools/script_edit.py" "$@"
+    ;;
+
+  fsm)
+    # The Lua embedded in a mission's FSM graph (art/missions/<m>/<v>/fig.p3d.rz).
+    # Edits are staged straight into work/mod. See docs/19-mission-fsm-format.md.
+    need_game
+    "$PY" "$ROOT/tools/stage_fsm.py" "$@"
+    ;;
+
+  mission)
+    need_game
+    [ -n "${1:-}" ] || die "usage: ./proto2 mission <name>"
+    ensure_mission_script
+    "$PY" "$ROOT/tools/mission_tree.py" "$MOD/scripts/missiondefinit.lua" dump "$1"
+    ;;
+
+  paths)
+    need_game
+    [ -n "${1:-}" ] || die "usage: ./proto2 paths <mission>"
+    ensure_mission_script
+    "$PY" "$ROOT/tools/mission_tree.py" "$MOD/scripts/missiondefinit.lua" paths "$1"
+    ;;
+
+  export)
+    need_game
+    [ -n "${1:-}" ] || die "usage: ./proto2 export <mission> [file]"
+    ensure_mission_script
+    "$PY" "$ROOT/tools/mission_tree.py" "$MOD/scripts/missiondefinit.lua" export "$1" "${2:-}"
+    ;;
+
+  apply-aspects)
+    need_game
+    [ -n "${1:-}" ] || die "usage: ./proto2 apply-aspects <file>"
+    ensure_mission_script
+    "$PY" "$ROOT/tools/mission_tree.py" "$MOD/scripts/missiondefinit.lua" apply "$1"
+    echo "run ./proto2 install to apply in game"
+    ;;
+
+  set-aspect)
+    need_game
+    [ -n "${3:-}" ] || die "usage: ./proto2 set-aspect <mission> <path> <value>"
+    ensure_mission_script
+    "$PY" "$ROOT/tools/mission_tree.py" "$MOD/scripts/missiondefinit.lua" set "$1" "$2" "$3"
+    echo "run ./proto2 install to apply"
+    ;;
+
+  missions)
+    need_game
+    tmp=$(mktemp -d "$ROOT/tmp/missions.XXXXXX"); trap 'rm -rf "$tmp"' EXIT
+    "$PY" "$ROOT/tools/rcf.py" "$GAME/boot.rcf" extract "$tmp" --filter 'scripts\missiondefinit.lua' >/dev/null 2>&1
+    "$PY" "$ROOT/tools/mission.py" "$tmp/scripts/missiondefinit.lua" list "$@"
+    ;;
+
+  fields)
+    need_game
+    [ -n "${1:-}" ] || die "usage: ./proto2 fields <mission>"
+    # Read the mod copy when we have one, so this agrees with `mission`, `paths`
+    # and `set-aspect` after an edit. Fall back to the archive for a fresh repo.
+    if [ -f "$MOD/scripts/missiondefinit.lua" ]; then
+      src="$MOD/scripts/missiondefinit.lua"
+    else
+      tmp=$(mktemp -d "$ROOT/tmp/fields.XXXXXX"); trap 'rm -rf "$tmp"' EXIT
+      "$PY" "$ROOT/tools/rcf.py" "$GAME/boot.rcf" extract "$tmp" --filter 'scripts\missiondefinit.lua' >/dev/null 2>&1
+      src="$tmp/scripts/missiondefinit.lua"
+    fi
+    "$PY" "$ROOT/tools/mission.py" "$src" fields "$1"
+    ;;
+
+  set-title)
+    need_game
+    mission="${1:-}"; title="${2:-}"
+    [ -n "$mission" ] && [ -n "$title" ] || die "usage: ./proto2 set-title <mission> <\"new title\">"
+    mkdir -p "$MOD/art/hud"
+    if [ ! -f "$MOD/art/hud/fe_textbible.p3d.rz" ]; then
+      tmp=$(mktemp -d "$ROOT/tmp/title.XXXXXX")
+      "$PY" "$ROOT/tools/rcf.py" "$GAME/boot.rcf" extract "$tmp" --filter fe_textbible >/dev/null 2>&1
+      "$PY" "$ROOT/tools/rcf.py" "$GAME/art.rcf" extract "$tmp" --filter textbible_english >/dev/null 2>&1
+      cp "$tmp/art/hud/fe_textbible.p3d.rz" "$MOD/art/hud/fe_textbible.p3d.rz"
+      cp "$tmp/art/hud/textbible_english.p3d" "$MOD/art/hud/textbible_english.p3d"
+      rm -rf "$tmp"
+    fi
+    tmp=$(mktemp -d "$ROOT/tmp/title.XXXXXX")
+    "$PY" "$ROOT/tools/rz.py" unwrap "$MOD/art/hud/fe_textbible.p3d.rz" "$tmp/fe.p3d" >/dev/null
+    "$PY" "$ROOT/tools/textbible.py" "$tmp/fe.p3d" set "MISSION_NAME_$mission" --value "$title" --out "$tmp/fe2.p3d"
+    "$PY" "$ROOT/tools/rz.py" wrap "$tmp/fe2.p3d" "$MOD/art/hud/fe_textbible.p3d.rz" >/dev/null
+    "$PY" "$ROOT/tools/textbible.py" "$MOD/art/hud/textbible_english.p3d" set "MISSION_NAME_$mission" --value "$title"
+    rm -rf "$tmp"
+    echo "run ./proto2 install to apply"
+    ;;
+
+  set-mission)
+    need_game
+    mission="${1:-}"; field="${2:-}"; value="${3:-}"
+    [ -n "$mission" ] && [ -n "$field" ] && [ -n "$value" ] || die "usage: ./proto2 set-mission <mission> <field> <value>"
+    mkdir -p "$MOD/scripts"
+    if [ ! -f "$MOD/scripts/missiondefinit.lua" ]; then
+      tmp=$(mktemp -d "$ROOT/tmp/setm.XXXXXX"); trap 'rm -rf "$tmp"' EXIT
+      "$PY" "$ROOT/tools/rcf.py" "$GAME/boot.rcf" extract "$tmp" --filter 'scripts\missiondefinit.lua' >/dev/null 2>&1
+      cp "$tmp/scripts/missiondefinit.lua" "$MOD/scripts/missiondefinit.lua"
+    fi
+    "$PY" "$ROOT/tools/mission.py" "$MOD/scripts/missiondefinit.lua" set "$mission" "$field" "$value"
+    echo "run ./proto2 install to apply"
+    ;;
+
+  titles)
+    need_game
+    tmp=$(mktemp -d "$ROOT/tmp/titles.XXXXXX")
+    trap 'rm -rf "$tmp"' EXIT
+    "$PY" "$ROOT/tools/rcf.py" "$GAME/art.rcf" extract "$tmp" \
+        --filter textbible_english >/dev/null 2>&1 || die "extract failed"
+    "$PY" "$ROOT/tools/textbible.py" "$tmp/art/hud/textbible_english.p3d" list --filter MISSION_NAME
+    ;;
+
+  build)
+    need_game
+    # Defaults keep `./proto2 build` a one-liner; any flag overrides them.
+    args=("$@")
+    case " $* " in *" --title "*) ;; *) args+=(--title "AWAKENING!!!") ;; esac
+    case " $* " in *" --tod "*)   ;; *) args+=(--tod TOD_GREENZONE_DAWN) ;; esac
+    "$PY" "$ROOT/tools/make_first_mission_mod.py" --game "$GAME" --out "$MOD" "${args[@]}"
+    ;;
+
+  install)
+    need_game
+    mkdir -p "$MOD"
+    "$PY" "$ROOT/tools/modstate.py" seed --mod "$MOD" \
+      --assets "$ROOT/assets/debugmenu" >/dev/null
+    # --no-debug is kept as a shortcut for --debug-mode none (bisect aid).
+    args=("$@"); mode=""
+    for a in "$@"; do
+      case "$a" in --no-debug) mode="--debug-mode none" ;; --debug-mode=*) ;; esac
+    done
+    out=()
+    for a in "${args[@]}"; do
+      [ "$a" = "--no-debug" ] && continue
+      out+=("$a")
+    done
+    # shellcheck disable=SC2086
+    "$PY" "$ROOT/tools/apply_mod.py" --game "$GAME" --mod "$MOD" --state "$STATE" "${out[@]}" $mode
+    ;;
+
+  publish)
+    bash "$ROOT/tools/publish_public.sh" "$@"
+    ;;
+
+  doctor)
+    "$PY" "$ROOT/tools/doctor.py"
+    ;;
+
+  launch)
+    # Attribution around one launch: archive the per-launch engine logs so an experiment's outcome can be read.
+    "$PY" "$ROOT/tools/launch.py" "$@"
+    ;;
+
+  config)
+    "$PY" "$ROOT/tools/config.py" "$@"
+    ;;
+
+  game)
+    if [ "$#" -eq 0 ] || [ "$1" = "show" ]; then
+      echo "game directory : $GAME"
+      echo "  source       : $GAME_FROM"
+      if [ -d "$GAME" ]; then
+        echo "  status       : exists"
+        [ -f "$GAME/prototype2engine.dll" ] && echo "  engine       : prototype2engine.dll found" \
+          || echo "  engine       : MISSING (is this the game directory?)"
+      else
+        echo "  status       : MISSING"
+      fi
+      echo
+      echo "change it with: ./proto2 game \"/path/to/Prototype 2\""
+    else
+      "$PY" "$ROOT/tools/config.py" set game_dir "$1"
+    fi
+    ;;
+
+  corpus)
+    "$PY" "$ROOT/tools/corpus_build.py" "$@"
+    # the tag-name table depends on the corpus and on the engine binary; refresh it so no tool needs tmp/
+    "$PY" "$ROOT/tools/build_tag_names.py" >/dev/null
+    "$PY" "$ROOT/tools/engine_fields.py" >/dev/null 2>&1
+    ;;
+
+  leaks)
+    "$PY" "$ROOT/tools/leakcheck.py" "$@"
+    ;;
+
+  served)
+    # The capture is the authority here, not prototype_fix.log: a converted record's payload is source text, so
+    # its presence proves the override was served. The log is context only.
+    need_game
+    LOG="$GAME/prototype_fix.log"
+    if [ -f "$LOG" ]; then
+      echo "log writes : $(date -r "$LOG" '+%H:%M')   loose mission lines: $(grep -c "art\\missions" "$LOG" || true)"
+    fi
+    "$PY" "$ROOT/tools/served.py" "$@"
+    ;;
+
+  bench)
+    "$PY" "$ROOT/tools/luadec_bench.py" "$@"
+    ;;
+
+  progress)
+    "$PY" "$ROOT/tools/recovery_report.py" "$@"
+    ;;
+
+  evidence)
+    # Which staged records a playthrough capture actually contains (did the reconstruction run?)
+    "$PY" "$ROOT/tools/capture_evidence.py" "$@"
+    ;;
+
+  spawn)
+    # Stage an entity spawn into a mission's Lua using the call shape proven in game (docs/19).
+    "$PY" "$ROOT/tools/spawn.py" "$@"
+    ;;
+
+  overrides)
+    # The hand-reconstructed records that no decompiler can regenerate (docs/26); a pack, not game data.
+    "$PY" "$ROOT/tools/overrides.py" "$@"
+    ;;
+
+  library)
+    # The engine's built-in Lua library (810 chunks in boot.rcf!art/startup_fig.p3d.rz); docs/21.
+    "$PY" "$ROOT/tools/library_index.py" "$@"
+    ;;
+
+  snapshot)
+    "$PY" "$ROOT/tools/mod_snapshot.py" "$@"
+    ;;
+
+  convert-all)
+    # Bulk smoke test: convert every provably equivalent bytecode record in every mission, aborting on the first
+    # failure. Snapshot first (./proto2 snapshot create) - this command does not create one for you.
+    "$PY" "$ROOT/tools/convert_all.py" "$@"
+    ;;
+
+  coverage)
+    "$PY" "$ROOT/tools/corpus_report.py" coverage "$@"
+    ;;
+
+  dupes)
+    "$PY" "$ROOT/tools/corpus_report.py" dupes "$@"
+    ;;
+
+  check)
+    # One command for the self-checks that were being run by hand after every change.
+    mkdir -p "$ROOT/tmp/check"
+    # tmp/ is scratch: rebuild the extracted corpus if it was cleaned, so the checks never silently measure nothing
+    if ! find "$ROOT/tmp/corpus" -name fig.p3d.rz -print -quit 2>/dev/null | grep -q .; then
+      echo "corpus missing - rebuilding with ./proto2 corpus"
+      "$PY" "$ROOT/tools/corpus_build.py" | tail -2
+    fi
+    fail=0
+    run_check() {
+      name="$1"; shift
+      out="$ROOT/tmp/check/$name.log"
+      if "$@" >"$out" 2>&1; then
+        printf 'PASS  %-28s %s\n' "$name" "$(tail -n 1 "$out" | cut -c1-70)"
+      else
+        printf 'FAIL  %-28s %s\n' "$name" "$(tail -n 3 "$out" | tr '\n' ' ' | cut -c1-90)"
+        fail=1
+      fi
+    }
+    run_check fsm-roundtrip "$PY" "$ROOT/tools/fsm_edit.py" verify
+    run_check gui-selftest  "$PY" "$ROOT/tools/mission_gui.py" --selftest
+    run_check gui-uicheck    "$PY" "$ROOT/tools/mission_gui.py" --uicheck
+    run_check single-truth   "$PY" "$ROOT/tools/test_single_truth.py"
+    run_check cli-help       "$PY" "$ROOT/tools/test_cli_help.py"
+    run_check literals       "$PY" "$ROOT/tools/test_literals.py"
+    run_check config         "$PY" "$ROOT/tools/test_config.py"
+    run_check paths          "$PY" "$ROOT/tools/test_paths.py"
+    run_check records        "$PY" "$ROOT/tools/test_records.py"
+    run_check equiv          "$PY" "$ROOT/tools/test_equiv.py"
+    run_check leaks          "$PY" "$ROOT/tools/test_leaks.py"
+    run_check debug-scripts  "$PY" "$ROOT/tools/test_debugscripts.py"
+    run_check refold         "$PY" "$ROOT/tools/test_refold.py"
+    run_check library        "$PY" "$ROOT/tools/test_library.py"
+    run_check overrides      "$PY" "$ROOT/tools/test_overrides.py"
+    run_check fsm-graph      "$PY" "$ROOT/tools/test_fsm_graph.py"
+    [ "$fail" = 0 ] && echo "all checks passed" || echo "some checks FAILED (logs in tmp/check/)"
+    exit "$fail"
+    ;;
+
+  capture)
+    # Keep the payload recorder installed between sessions: removing it has silently cost sessions before.
+    sub="${1:-status}"
+    CAP_IN="$GAME/proto2_inflate2.in"
+    ASI="$GAME/proto2_inflate2.asi"
+    case "$sub" in
+      on)
+        need_game
+        ver="${2:-$("$PY" "$ROOT/tools/config.py" get capture_version)}"
+        rm -f "$GAME"/proto2_inflate[23456].asi
+        case "$ver" in
+          v2) src="$ROOT/build/proto2_inflate2.asi"; dst="$GAME/proto2_inflate2.asi" ;;
+          v3) src="$ROOT/build/proto2_inflate3.asi"; dst="$GAME/proto2_inflate3.asi" ;;
+          v4) src="$ROOT/build/proto2_inflate4.asi"; dst="$GAME/proto2_inflate4.asi" ;;
+          v5) src="$ROOT/build/proto2_inflate5.asi"; dst="$GAME/proto2_inflate5.asi" ;;
+          v6) src="$ROOT/build/proto2_inflate6.asi"; dst="$GAME/proto2_inflate6.asi" ;;
+          *) die "usage: ./proto2 capture on [v2|v3|v4|v5|v6]" ;;
+        esac
+        [ -f "$src" ] || die "$src missing"
+        "$PY" "$ROOT/tools/check_asi.py" "$src" >/dev/null
+        cp "$src" "$dst"
+        echo "recorder installed: $dst ($ver)"
+        echo "every launch appends a capture; run './proto2 harvest' after a session"
+        ;;
+      off)
+        # every version, not a hand-kept list: leaving v6 behind made `off` claim success while the recorder was
+        # still installed (it is the current version, so it was the one file the list missed).
+        for v in 2 3 4 5 6; do
+          f="$GAME/proto2_inflate$v.asi"
+          [ -f "$f" ] && rm -f "$f" && echo "removed $(basename "$f")"
+        done
+        for v in 2 3 4 5 6; do
+          f="$GAME/proto2_inflate$v.in"
+          [ -f "$f" ] && echo "unharvested capture left at $f"
+        done
+        ;;
+      status)
+        if [ -f "$GAME/proto2_inflate6.asi" ]; then echo "recorder: installed (v6, stack scan)"
+        elif [ -f "$GAME/proto2_inflate5.asi" ]; then echo "recorder: installed (v5, caller + caller's caller)"
+        elif [ -f "$GAME/proto2_inflate4.asi" ]; then echo "recorder: installed (v4, caller + window probe)"
+        elif [ -f "$GAME/proto2_inflate3.asi" ]; then echo "recorder: installed (v3, caller logging)"
+        elif [ -f "$GAME/proto2_inflate2.asi" ]; then echo "recorder: installed (v2, output only)"
+        else echo "recorder: NOT installed"; fi
+        for f in "$GAME"/proto2_inflate[23456].in; do
+          [ -f "$f" ] && echo "capture : $(stat -c%s "$f") bytes ($(basename "$f"))"
+        done
+        "$PY" - <<'PY' 2>/dev/null || true
+import json, os
+p = os.path.join("artifacts", "lua-cache.json")
+n = len(json.load(open(p))) if os.path.exists(p) else 0
+print(f"cache   : {n} stream(s) in artifacts/lua-cache.json")
+PY
+        ;;
+      *) die "usage: ./proto2 capture on|off|status" ;;
+    esac
+    ;;
+
+  harvest)
+    need_game
+    if [ -n "${PROTO2_CAPTURE:-}" ]; then
+      CAP="$PROTO2_CAPTURE"
+    elif [ -f "$GAME/proto2_inflate6.in" ]; then
+      CAP="$GAME/proto2_inflate6.in"
+    elif [ -f "$GAME/proto2_inflate5.in" ]; then
+      CAP="$GAME/proto2_inflate5.in"
+    elif [ -f "$GAME/proto2_inflate4.in" ]; then
+      CAP="$GAME/proto2_inflate4.in"
+    elif [ -f "$GAME/proto2_inflate3.in" ]; then
+      CAP="$GAME/proto2_inflate3.in"
+    else
+      CAP="$GAME/proto2_inflate2.in"
+    fi
+    [ -f "$CAP" ] || die "no capture at $CAP - launch the game once with the recorder on (./proto2 capture on)"
+    mkdir -p "$ROOT/artifacts/inflate"
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    "$PY" "$ROOT/tools/harvest_inflate.py" --capture "$CAP" \
+      --cache "$ROOT/artifacts/lua-cache.json" --bytecode-dir "$ROOT/work/bytecode" --stats --callers --stacks
+    mv "$CAP" "$ROOT/artifacts/inflate/session-$stamp.in"
+    base="$(basename "$CAP" .in)"
+    [ -f "$GAME/$base.log" ] && mv "$GAME/$base.log" "$ROOT/artifacts/inflate/session-$stamp.log"
+    echo "archived: artifacts/inflate/session-$stamp.{in,log}"
+    "$PY" "$ROOT/tools/script_edit.py" --mission story_a1 coverage 2>/dev/null | head -4 || true
+    echo "recorder stays installed - next launch captures again"
+    ;;
+
+  seed)
+    # copy the tracked debug-menu payload into work/mod if it is missing
+    mkdir -p "$MOD"
+    "$PY" "$ROOT/tools/modstate.py" seed --mod "$MOD" \
+      --assets "$ROOT/assets/debugmenu"
+    ;;
+
+  clean)
+    # Reset work/mod to the payload alone and make the game match. Keeps
+    # backup/ and the manifest, so revert still knows what was displaced.
+    do_install=1
+    for a in "$@"; do case "$a" in --no-install) do_install=0 ;; esac; done
+    "$PY" "$ROOT/tools/modstate.py" clean --mod "$MOD" \
+      --assets "$ROOT/assets/debugmenu"
+    if [ "$do_install" = 1 ]; then
+      need_game
+      "$PY" "$ROOT/tools/apply_mod.py" --game "$GAME" --mod "$MOD" --state "$STATE"
+    fi
+    ;;
+
+  state)
+    "$PY" "$ROOT/tools/modstate.py" state --mod "$MOD" \
+      --assets "$ROOT/assets/debugmenu"
+    ;;
+
+  revert)
+    need_game
+    # --no-debug is kept as a shortcut for --debug-mode none (bisect aid).
+    args=("$@"); mode=""
+    for a in "$@"; do
+      case "$a" in --no-debug) mode="--debug-mode none" ;; --debug-mode=*) ;; esac
+    done
+    out=()
+    for a in "${args[@]}"; do
+      [ "$a" = "--no-debug" ] && continue
+      out+=("$a")
+    done
+    # shellcheck disable=SC2086
+    "$PY" "$ROOT/tools/apply_mod.py" --game "$GAME" --mod "$MOD" --state "$STATE" "${out[@]}" $mode --revert
+    # revert undoes the install; staged edits stay in work/mod and the next Install would copy them back
+    staged=$(find "$MOD" -type f -not -path "*/backup/*" 2>/dev/null | wc -l)
+    if [ "$staged" -gt 0 ]; then
+        echo "note: $staged file(s) are still staged in work/mod (revert only undid the install)."
+        echo "      ./proto2 clean discards them and reinstalls the debug-menu payload + override pack."
+    fi
+    ;;
+
+  verify)
+    [ -d "$MOD" ] || die "nothing built yet; run ./proto2 build"
+    # Verifies whatever the mod set currently holds, because it is not always the
+    # first-mission mod: the debug menu alone is a valid set. The bible/title and
+    # missiondefinit checks run only when those artefacts are present.
+    "$PY" - "$ROOT" <<'PYEOF'
+import sys, os
+root=sys.argv[1]; sys.path.insert(0, os.path.join(root,'tools'))
+from rz import unwrap
+mod=os.path.join(root,'work','mod')
+
+files=[]
+for dirpath, dirnames, names in os.walk(mod):
+    dirnames[:] = [d for d in dirnames if d != 'backup']
+    for n in names:
+        if n == 'install-manifest.json':
+            continue
+        files.append(os.path.relpath(os.path.join(dirpath, n), mod))
+files.sort()
+
+ok = 0
+for rel in files:
+    p = os.path.join(mod, rel)
+    note = ''
+    if rel.endswith('.rz'):
+        raw = unwrap(open(p, 'rb').read())
+        note = f'   {os.path.getsize(p)} stored -> {len(raw)} bytes'
+        ok += 1
+    print(f'  {rel:<42}{note}')
+print(f'{len(files)} file(s) in the mod set, {ok} RZ stream(s) decompress\n')
+
+tb = os.path.join(mod, 'art/hud/fe_textbible.p3d.rz')
+if os.path.exists(tb):
+    from textbible import holders
+    h = next(x for x in holders(unwrap(open(tb, 'rb').read()))
+             if x.language.lower() == 'english')
+    print('fe_textbible title :', repr(h.value(h.index('MISSION_NAME_story_intro2'))))
+    t2 = os.path.join(mod, 'art/hud/textbible_english.p3d')
+    if os.path.exists(t2):
+        h2 = holders(open(t2, 'rb').read())[0]
+        print('standalone title   :',
+              repr(h2.value(h2.index('MISSION_NAME_story_intro2'))))
+else:
+    print('bibles             : not overridden (game uses boot.rcf/art.rcf)')
+
+md = os.path.join(mod, 'scripts/missiondefinit.lua')
+if os.path.exists(md):
+    from lua51 import load, resolve_path
+    lua = load(open(md, 'rb').read())
+    n = resolve_path(lua, '103')
+    print('mission            :', n.constants[0].decode(),
+          ' TOD:', n.constants[42].decode())
+    print('protos preserved   :', len(lua.protos), 'top-level definitions')
+else:
+    print('missiondefinit     : not overridden (game uses boot.rcf)')
+PYEOF
+    ;;
+
+  bundle)
+    out="${1:-$ROOT/dist/proto2-tools.tar.gz}"
+    mkdir -p "$(dirname "$out")"
+    tar -czf "$out" -C "$ROOT" \
+        --exclude='__pycache__' \
+        proto2 tools README.md LICENSE reimpl/crates reimpl/Cargo.toml \
+        2>/dev/null || true
+    echo "wrote $out ($(du -h "$out" | cut -f1))"
+    echo "extract it anywhere and run ./proto2 status with PROTO2_GAME pointing at the game"
+    ;;
+
+  gui)
+    # Desktop editor for every edit the tooling supports. Front end only: it
+    # calls the same modules as the CLI and stages into work/mod.
+    # See docs/20-mission-editor-gui.md.
+    need_game
+    exec "$PY" "$ROOT/tools/mission_gui.py" "$@"
+    ;;
+
+  play)
+    need_game
+    cat <<EOF
+Launch the game through Steam or:
+  "$GAME/prototype2.exe"
+(or with Proton:  protontricks-launch --appid 115320 "$GAME/prototype2.exe")
+
+After it starts, confirm the override was used:
+  grep -iE "fe_textbible|textbible_english|missiondefinit" "$GAME/prototype_fix.log" | tail
+
+Undo everything:
+  ./proto2 revert
+EOF
+    ;;
+
+  help|-h|--help)
+    # the header block runs from line 2 to the "set -euo pipefail" line, so adding commands cannot truncate it
+    sed -n '2,/^set -euo pipefail$/p' "$ROOT/proto2" | sed '/^set -euo pipefail$/d; s/^# \{0,1\}//' 
+    ;;
+
+  *)
+    die "unknown command '$cmd' (try ./proto2 help)"
+    ;;
+esac

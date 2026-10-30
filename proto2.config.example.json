@@ -1,0 +1,9 @@
+{
+  "_readme": "Copy this to proto2.config.json (git-ignored) and edit, or use ./proto2 config set KEY VALUE. Unknown keys are ignored.",
+  "game_dir": "/SteamLibrary/steamapps/common/Prototype 2",
+  "capture_version": "v6",
+  "gui_text_size": 10,
+  "gui_theme": "light",
+  "gui_last_mission": "",
+  "proton_prefix": "/SteamLibrary/steamapps/compatdata/115320/pfx"
+}

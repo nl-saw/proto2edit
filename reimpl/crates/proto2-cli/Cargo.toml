@@ -1,0 +1,15 @@
+[package]
+name = "proto2-cli"
+description = "Inspect, verify and extract Prototype 2 assets (RCF, P3D, RZ, Lua 5.1 bytecode)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "proto2"
+path = "src/main.rs"
+
+[dependencies]
+cement = { workspace = true }
+engine = { path = "../engine" }

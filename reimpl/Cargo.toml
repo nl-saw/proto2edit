@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cement",
+    "crates/proto2-cli",
+    "crates/engine",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/nl-saw/proto2edit"
+rust-version = "1.75"
+
+[workspace.dependencies]
+cement = { path = "crates/cement" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"

@@ -1,0 +1,9 @@
+[package]
+name = "cement"
+description = "Readers and writers for Radical Entertainment 'Cement' engine containers (.rcf archives, .p3d Pure3D chunks, RZ streams, Lua 5.1 bytecode)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]

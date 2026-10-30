@@ -1,0 +1,28 @@
+# Scratch space - always use ./tmp inside this repo (see AGENTS.md).
+tmp/
+
+# Derived game data and analysis output. Everything here is regenerable from the game install
+# (./proto2 corpus), produced by the tools, or measured evidence kept for the working copy only.
+work/
+build/
+analysis/
+artifacts/
+missions/
+docs/
+asi/
+reference/
+findings/
+dist/
+reimpl/target/
+
+# Python bytecode.
+__pycache__/
+*.pyc
+
+# Machine-local settings; the committed template is proto2.config.example.json.
+proto2.config.json
+.proto2-game
+
+# Editor lock files (LibreOffice/OpenOffice) must never dirty the tree.
+.~lock.*#
+AGENTS.md
